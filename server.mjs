@@ -35,7 +35,10 @@ const PORT = Number(process.env.PORT) || 7843;
 const HOST = process.env.HOST || '127.0.0.1';                 // 本機＝127.0.0.1；常駐伺服器要開放區網可設 0.0.0.0
 // 「執行查核日」當天、本地時間幾點後算正式查核（台灣 9 點）；內建排程器也固定在這個時點（每天一次）動作，兩者永遠一致。
 const CHECK_HOUR = process.env.CHECK_HOUR != null ? Number(process.env.CHECK_HOUR) : 9; // 設為 0–23 以外即關閉排程器（僅開頁時查核）
-const BACKUP_KEEP = process.env.BACKUP_KEEP != null ? Number(process.env.BACKUP_KEEP) : 30; // 保留最近幾份每日備份（0 = 關閉備份）
+// 保留最近幾份每日備份：未設或填了非數字（手誤）→ 退回預設 30，不讓「備份」這種保命功能被打字錯誤靜默關掉；明確填 0（或負數）才關閉。
+const _bkKeepRaw = process.env.BACKUP_KEEP;
+const _bkKeepNum = Number(_bkKeepRaw);
+const BACKUP_KEEP = (_bkKeepRaw != null && _bkKeepRaw !== '' && Number.isFinite(_bkKeepNum)) ? _bkKeepNum : 30;
 
 // ──────────────────────────────────────────────────────────
 // ZIP 解壓（最小實作，支援 STORED + DEFLATE）
@@ -768,9 +771,15 @@ async function backupGroups() {
     const tmp = `${dest}.tmp-${process.pid}-${++_bkSeq}`;
     await writeFile(tmp, raw, 'utf8');
     await rename(tmp, dest);                                        // 原子寫入，備份檔本身也不會寫一半
-    const files = (await readdir(BACKUP_DIR)).filter((f) => /^groups-\d{8}\.json$/.test(f)).sort();
-    for (const f of files.slice(0, Math.max(0, files.length - BACKUP_KEEP))) await unlink(path.join(BACKUP_DIR, f)).catch(() => {});
-    LAST_BACKUP = { at: new Date().toISOString(), ok: true, file };
+    LAST_BACKUP = { at: new Date().toISOString(), ok: true, file };  // 寫入已成功；後續修剪是盡力而為，失敗不該蓋掉這個成功狀態
+    try {
+      const all = await readdir(BACKUP_DIR);
+      const dated = all.filter((f) => /^groups-\d{8}\.json$/.test(f)).sort();   // 零填日期 → 字典序＝時間序
+      for (const f of dated.slice(0, Math.max(0, dated.length - BACKUP_KEEP))) await unlink(path.join(BACKUP_DIR, f)).catch(() => {});
+      // 清掉先前崩潰/中斷殘留的 .tmp 暫存檔（修剪 regex 不含 .tmp，否則會無限累積）；排除本行程正在寫的暫存檔以免誤刪
+      const mine = `.tmp-${process.pid}-`;
+      for (const f of all.filter((f) => /^groups-\d{8}\.json\.tmp-/.test(f) && !f.includes(mine))) await unlink(path.join(BACKUP_DIR, f)).catch(() => {});
+    } catch { /* 修剪盡力而為，不影響已寫入的備份 */ }
   } catch (e) {
     LAST_BACKUP = { at: new Date().toISOString(), ok: false, error: String(e.message || e) };
     console.error('  備份 groups.json 失敗（不影響查核）：', LAST_BACKUP.error);
@@ -1018,8 +1027,9 @@ const server = http.createServer(async (req, res) => {
         const db = await loadGroups();
         const g = db.groups.find((x) => x.id === mm[1]);
         if (!g) return sendJSON(res, 404, { error: '找不到任務' });
-        g.watchlist = g.watchlist.filter((l) => l.pcode !== mm[2]);
-        if (g.state) delete g.state[mm[2]];
+        const pcode = decodeURIComponent(mm[2]);
+        g.watchlist = g.watchlist.filter((l) => l.pcode !== pcode);
+        if (g.state) delete g.state[pcode];
         await saveGroups(db);
         return sendJSON(res, 200, { group: g });
       });
@@ -1032,7 +1042,7 @@ const server = http.createServer(async (req, res) => {
         const db = await loadGroups();
         const g = db.groups.find((x) => x.id === mm[1]);
         if (!g) return sendJSON(res, 404, { error: '找不到任務' });
-        const law = (g.watchlist || []).find((l) => l.pcode === mm[2]);
+        const law = (g.watchlist || []).find((l) => l.pcode === decodeURIComponent(mm[2]));
         if (!law) return sendJSON(res, 404, { error: '找不到法規' });
         if (body.manualDate !== undefined) law.manualDate = ymdNorm(body.manualDate) || null;
         if (body.reviewedTo !== undefined) law.reviewedTo = ymdNorm(body.reviewedTo) || null; // 已閱：使用者已看過此版本的新舊對照
@@ -1072,8 +1082,9 @@ const server = http.createServer(async (req, res) => {
 
     if ((mm = p.match(/^\/api\/laws\/([^/]+)\/history$/)) && m === 'GET') {
       const histories = await readJSON(HISTORIES_PATH, {});
-      const meta = lawMeta(mm[1]);
-      return sendJSON(res, 200, { pcode: mm[1], name: meta && meta.name, history: histories[mm[1]] || '' });
+      const pcode = decodeURIComponent(mm[1]);
+      const meta = lawMeta(pcode);
+      return sendJSON(res, 200, { pcode, name: meta && meta.name, history: histories[pcode] || '' });
     }
 
     if ((mm = p.match(/^\/api\/laws\/([^/]+)\/diff$/)) && m === 'GET') {
@@ -1119,7 +1130,7 @@ async function start() {
     const schOn = CHECK_HOUR >= 0 && CHECK_HOUR <= 23;
     console.log(`  排程器：${schOn ? `每天 ${String(CHECK_HOUR).padStart(2, '0')}:05（本機時間≈台灣）＋啟動時，自動查核到期任務` : '已關閉（僅開頁時查核）'}\n`);
   });
-  backupGroups();   // 啟動時先備份一次：即使當天無任何變更，也確保有一份當日快照
+  backupGroups().catch(() => {});   // 啟動時先備份一次：即使當天無任何變更，也確保有一份當日快照（防護：永不影響啟動）
   // 內建排程器：①啟動後 4 秒補做一次（涵蓋停機/重啟期間錯過的，會自動補完多期）；
   // ②每天 CHECK_HOUR:05（本機時間）跑一次——挑「9 點剛過」是因為任務正是在執行查核日當天 9 點跨過到期門檻，這時動作當天上午就完成。
   if (CHECK_HOUR >= 0 && CHECK_HOUR <= 23) {
