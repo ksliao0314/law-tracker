@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>法規更新查核</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">§</span>
+    <div>
+      <h1>法規更新查核</h1>
+      <p class="sub">追蹤指定法規自上次查核後是否修正</p>
+    </div>
+  </div>
+  <div class="topbar-status" id="syncStatus"></div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <h2>任務</h2>
+      <button class="btn small primary" id="btnNewGroup">＋ 新增</button>
+    </div>
+    <ul class="group-list" id="groupList"></ul>
+  </aside>
+
+  <section class="detail" id="detail">
+    <div class="empty" id="emptyDetail">
+      <p>請從左側選擇或新增一個任務。</p>
+      <p class="muted">每個任務（當事人 / 案件）可建立各自的法規清單與查核排程。</p>
+    </div>
+  </section>
+</main>
+
+<!-- 通用 modal -->
+<div class="modal-overlay" id="overlay" hidden>
+  <div class="modal" id="modal"></div>
+</div>
+
+<!-- 自動查核遮罩（查核中請勿關閉） -->
+<div class="checking-overlay" id="checkingOverlay" hidden>
+  <div class="co-box">
+    <span class="spinner big"></span>
+    <p class="co-msg">查核中…請勿關閉視窗</p>
+    <p class="co-sub">同步最新法規並比對中，完成後會自動更新畫面。</p>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

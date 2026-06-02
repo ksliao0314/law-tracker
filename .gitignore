@@ -1,0 +1,21 @@
+# ── 私密 / 可重建的資料：一律不上傳 ───────────────────────────
+# 使用者的任務清單（含當事人名稱）── 絕對不可外流
+data/groups.json
+# 法規資料庫快取與索引：體積大、首次查核會自動重新下載
+data/moj-index.json
+data/moj-histories.json
+data/ly-laws.json
+data/ly-reasons.json
+data/gazette.json
+data/articles/
+# 例外：保留搜尋用的種子目錄（公開、CC0 開放資料，讓首次 clone 即可搜尋）
+!data/pcode_all.json
+
+# 未來若加入發信等設定（含金鑰）一律本機保存、不上傳
+config.local.json
+*.secret
+
+# 系統 / 其他
+.DS_Store
+*.log
+node_modules/
