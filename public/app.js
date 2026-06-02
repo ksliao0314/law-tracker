@@ -60,12 +60,25 @@ async function load() {
   state.db = data.db; state.sync = data.sync; state.refreshing = data.refreshing; state.groups = data.groups;
   if (state.selectedId && !state.groups.find((g) => g.id === state.selectedId)) state.selectedId = null;
   if (!state.selectedId && state.groups.length) state.selectedId = state.groups[0].id;
-  renderGroups(); renderDetail(); renderSyncStatus();
+  renderGroups(); renderDetail(); renderSyncStatus(); watchIndexReady();
+}
+
+// 首次部署時法規庫在背景下載：未就緒前每 2.5 秒重抓狀態，下載完成就自動重整 →
+// 讓「下載前先加入的真法規」自動歸位到追蹤清單（不再卡在「應手動查詢」），使用者免手動重整。
+let _idxPolls = 0;
+function watchIndexReady() {
+  clearTimeout(state._idxTimer);
+  if (state.db && !state.refreshing) { _idxPolls = 0; return; }            // 索引已就緒 → 停止輪詢
+  if (!state.refreshing && state.sync && state.sync.error) return;          // 下載失敗 → 停止，由同步狀態列顯示錯誤供手動重試
+  if (_idxPolls++ > 80) return;                                            // 上限約 200 秒，避免離線時無限輪詢
+  state._idxTimer = setTimeout(() => load().catch(() => {}), 2500);
 }
 // 資料同步狀態（角落）：正常時低調、失敗或過期時明顯並可點擊重試
 function renderSyncStatus() {
   const el = document.getElementById('syncStatus'); if (!el) return;
   const s = state.sync || {};
+  if (state.refreshing && !state.db) { el.innerHTML = `<span class="sync stale"><span class="spinner"></span>　法規資料庫準備中…（首次啟動，完成後法規自動就緒）</span>`; return; }
+  if (state.refreshing) { el.innerHTML = `<span class="sync stale"><span class="spinner"></span>　更新法規資料庫中…</span>`; return; }
   if (s.error) el.innerHTML = `<span class="sync err" data-act="resync" title="${esc(s.error)}">⚠ 資料同步失敗，點此重試</span>`;
   else if (s.fresh) el.innerHTML = `<span class="sync ok">✓ 資料已同步</span>`;
   else if (s.fetchedAt) el.innerHTML = `<span class="sync stale" data-act="resync">資料基準 ${s.fetchedAt.slice(0, 10)}（點此更新）</span>`;
