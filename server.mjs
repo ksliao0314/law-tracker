@@ -5,7 +5,7 @@
 // 每部法規的 LawModifiedDate（西元 YYYYMMDD）即「最新修正日期」。
 
 import http from 'node:http';
-import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, rename, mkdir, readdir, unlink } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,7 @@ const INDEX_PATH = path.join(DATA_DIR, 'moj-index.json');
 const HISTORIES_PATH = path.join(DATA_DIR, 'moj-histories.json');
 const SEED_PATH = path.join(DATA_DIR, 'pcode_all.json');
 const ARTICLES_DIR = path.join(DATA_DIR, 'articles');
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');            // groups.json 每日備份目錄
 
 const LAW_API = 'https://law.moj.gov.tw/api/Ch/Law/JSON';
 const ORDER_API = 'https://law.moj.gov.tw/api/Ch/Order/JSON';
@@ -34,6 +35,7 @@ const PORT = Number(process.env.PORT) || 7843;
 const HOST = process.env.HOST || '127.0.0.1';                 // 本機＝127.0.0.1；常駐伺服器要開放區網可設 0.0.0.0
 // 「執行查核日」當天、本地時間幾點後算正式查核（台灣 9 點）；內建排程器也固定在這個時點（每天一次）動作，兩者永遠一致。
 const CHECK_HOUR = process.env.CHECK_HOUR != null ? Number(process.env.CHECK_HOUR) : 9; // 設為 0–23 以外即關閉排程器（僅開頁時查核）
+const BACKUP_KEEP = process.env.BACKUP_KEEP != null ? Number(process.env.BACKUP_KEEP) : 30; // 保留最近幾份每日備份（0 = 關閉備份）
 
 // ──────────────────────────────────────────────────────────
 // ZIP 解壓（最小實作，支援 STORED + DEFLATE）
@@ -749,7 +751,31 @@ async function loadGroups() {
   if (!db || !Array.isArray(db.groups)) return { version: 1, groups: [] };   // 防護：損壞的 groups.json 不致讓所有 API 壞掉
   return db;
 }
-async function saveGroups(db) { await writeJSONAtomic(GROUPS_PATH, db); }
+async function saveGroups(db) { await writeJSONAtomic(GROUPS_PATH, db); await backupGroups(); }
+
+// 每日備份 groups.json —— 你的「任務設定＋查核歷史＋各法規版本基準」是唯一無法重建的資料：
+// 法規索引壞了可重抓，但這個檔誤刪／損壞／磁碟故障就全失。以當天日期為檔名（同日多次儲存覆蓋同一份＝永遠最新），保留最近 BACKUP_KEEP 天。
+let LAST_BACKUP = null;   // { at, ok, error, file } 供日後 UI／通知顯示
+let _bkSeq = 0;
+async function backupGroups() {
+  if (!(BACKUP_KEEP > 0)) return;                                  // BACKUP_KEEP=0 → 關閉備份
+  try {
+    const raw = await readFile(GROUPS_PATH, 'utf8').catch(() => null);
+    if (!raw || raw.trim().length < 2) return;                     // 全新安裝、尚無資料 → 不備份
+    await mkdir(BACKUP_DIR, { recursive: true });
+    const file = `groups-${todayYmd()}.json`;
+    const dest = path.join(BACKUP_DIR, file);
+    const tmp = `${dest}.tmp-${process.pid}-${++_bkSeq}`;
+    await writeFile(tmp, raw, 'utf8');
+    await rename(tmp, dest);                                        // 原子寫入，備份檔本身也不會寫一半
+    const files = (await readdir(BACKUP_DIR)).filter((f) => /^groups-\d{8}\.json$/.test(f)).sort();
+    for (const f of files.slice(0, Math.max(0, files.length - BACKUP_KEEP))) await unlink(path.join(BACKUP_DIR, f)).catch(() => {});
+    LAST_BACKUP = { at: new Date().toISOString(), ok: true, file };
+  } catch (e) {
+    LAST_BACKUP = { at: new Date().toISOString(), ok: false, error: String(e.message || e) };
+    console.error('  備份 groups.json 失敗（不影響查核）：', LAST_BACKUP.error);
+  }
+}
 
 // 群組寫入序列化：把所有「讀取→修改→寫回 groups.json」的交易排成一條佇列，
 // 避免兩個並行請求各自 loadGroups 後又各自 saveGroups、互相覆蓋而遺失任務。
@@ -1093,6 +1119,7 @@ async function start() {
     const schOn = CHECK_HOUR >= 0 && CHECK_HOUR <= 23;
     console.log(`  排程器：${schOn ? `每天 ${String(CHECK_HOUR).padStart(2, '0')}:05（本機時間≈台灣）＋啟動時，自動查核到期任務` : '已關閉（僅開頁時查核）'}\n`);
   });
+  backupGroups();   // 啟動時先備份一次：即使當天無任何變更，也確保有一份當日快照
   // 內建排程器：①啟動後 4 秒補做一次（涵蓋停機/重啟期間錯過的，會自動補完多期）；
   // ②每天 CHECK_HOUR:05（本機時間）跑一次——挑「9 點剛過」是因為任務正是在執行查核日當天 9 點跨過到期門檻，這時動作當天上午就完成。
   if (CHECK_HOUR >= 0 && CHECK_HOUR <= 23) {

@@ -1,6 +1,8 @@
 # ── 私密 / 可重建的資料：一律不上傳 ───────────────────────────
 # 使用者的任務清單（含當事人名稱）── 絕對不可外流
 data/groups.json
+# groups.json 的每日備份（同樣含當事人名稱）── 絕對不可外流
+data/backups/
 # 法規資料庫快取與索引：體積大、首次查核會自動重新下載
 data/moj-index.json
 data/moj-histories.json
