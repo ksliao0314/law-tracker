@@ -165,6 +165,9 @@ function addMonths(ymd, months) {
   return String(y) + String(mo + 1).padStart(2, '0') + String(da).padStart(2, '0');
 }
 function todayYmd() { const d = new Date(); return String(d.getFullYear()) + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0'); }
+// 查核頻率(月)防呆：負數→0(不定期)、小數無條件捨去、超大值設上限(1200 月)、非數字→0；
+// 避免從 API／手改 groups.json 灌入負數或小數，讓 addMonths 把下次基準日倒推或算出亂碼日期(任務永遠到期空轉)。
+function clampFreq(v) { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(0, Math.min(1200, n)) : 0; }
 function dueYmd(group) { const n = ymdNorm(group.nextBaselineDate); if (!n) return ''; return addDays(n, group.lagDays ?? DEFAULT_LAG_DAYS); }
 // 是否已到「執行查核日」可做正式查核：超過執行查核日→是；當天→上午 9 點後才算（避免資料尚未上線）。
 function isDueNow(group) {
@@ -287,8 +290,28 @@ function indexIsFresh() {
   if (!INDEX || !INDEX.fetchedAt) return false;
   return new Date(INDEX.fetchedAt).toLocaleDateString('en-CA') === new Date().toLocaleDateString('en-CA');
 }
+// 追蹤中的「真法規」是否有缺「當前版本」的條文快照？快照只在「下載時該法規已在清單中」才會建；
+// 缺了新舊對照會失敗(尚無條文快照)，所以查核時若偵測到缺，就再下載一次補建(涵蓋首次部署、以及在索引已是當日最新的日子新加法規)。
+async function watchedMissingSnapshot() {
+  if (!INDEX) return false;                                      // 沒索引時無從判斷，交由索引下載本身處理
+  try {
+    const db = await loadGroups();
+    for (const g of db.groups) {
+      for (const l of (g.watchlist || [])) {
+        if (l.manual || String(l.pcode).startsWith('MANUAL-')) continue;   // 手動項目不需快照
+        const meta = lawMeta(l.pcode);
+        if (!meta || !meta.modifiedDate) continue;               // 不在索引的法規本就無快照可建，略過
+        const snap = await readJSON(path.join(ARTICLES_DIR, l.pcode + '.json'), null);
+        if (!snap || !snap.versions || !snap.versions[meta.modifiedDate]) return true;
+      }
+    }
+  } catch { /* 判斷失敗就當作不缺，不影響查核 */ }
+  return false;
+}
 async function ensureFreshIndex() {
-  if (refreshing || indexIsFresh()) return;
+  for (let i = 0; refreshing && i < 300; i++) await sleep(300);   // 有下載進行中(如首次部署的背景下載)→ 等它完成(最多約 90 秒)，避免查核撞上 INDEX 仍為 null 而報「尚未就緒」
+  if (refreshing) return;                                         // 等待逾時仍在下載 → 不重複觸發
+  if (indexIsFresh() && !(await watchedMissingSnapshot())) return; // 當日已抓且追蹤法規快照齊全 → 免重抓；缺快照(剛加入/首次部署)則再抓一次補建
   try { await refreshIndex(); LAST_SYNC = { at: new Date().toISOString(), ok: true }; }
   catch (e) { LAST_SYNC = { at: new Date().toISOString(), ok: false, error: String(e.message || e) }; if (!INDEX) throw e; /* 有舊索引就沿用，不阻斷查核 */ }
 }
@@ -961,7 +984,7 @@ const server = http.createServer(async (req, res) => {
           id: newId(), name, note: (body.note || '').trim(),
           baselineDate: ymdNorm(body.baselineDate) || null,          // 前次查核基準日（可空＝第一次查核）
           nextBaselineDate: ymdNorm(body.nextBaselineDate) || null,  // 下次查核基準日
-          frequencyMonths: Number(body.frequencyMonths) || 0,        // 查核頻率（月）
+          frequencyMonths: clampFreq(body.frequencyMonths),        // 查核頻率（月，已防呆）
           lagDays: body.lagDays != null ? Number(body.lagDays) : DEFAULT_LAG_DAYS,
           watchlist: [], state: {}, history: [],
           prevCheckedAt: null, lastCheckedAt: null, createdAt: new Date().toISOString(),
@@ -984,7 +1007,7 @@ const server = http.createServer(async (req, res) => {
           if (body.note != null) g.note = String(body.note).trim();
           if (body.baselineDate !== undefined) g.baselineDate = ymdNorm(body.baselineDate) || null;
           if (body.nextBaselineDate !== undefined) g.nextBaselineDate = ymdNorm(body.nextBaselineDate) || null;
-          if (body.frequencyMonths != null) g.frequencyMonths = Number(body.frequencyMonths) || 0;
+          if (body.frequencyMonths != null) g.frequencyMonths = clampFreq(body.frequencyMonths);
           if (body.lagDays != null) g.lagDays = Number(body.lagDays);
           if (body.paused != null) g.paused = !!body.paused;     // 停用／恢復（紀錄保留）
           delete g.frequencyDays;
@@ -1121,6 +1144,11 @@ async function start() {
   INDEX = await readJSON(INDEX_PATH, null);
   HISTORIES = await readJSON(HISTORIES_PATH, {});
   buildSearchList();
+  server.on('error', (e) => {   // 啟動失敗(最常見：埠被占用＝已在執行/被別的程式占用)→ 給看得懂的訊息，而非噴 stack trace 閃退
+    if (e.code === 'EADDRINUSE') console.error(`\n  ✗ 埠 ${PORT} 已被占用——本工具可能已經在執行(請直接開瀏覽器)，或請改用其他埠重啟：\n      PORT=7844 node server.mjs\n`);
+    else console.error('\n  ✗ 伺服器啟動失敗：', e.message, '\n');
+    process.exit(1);
+  });
   server.listen(PORT, HOST, () => {
     const stamp = INDEX ? `法規庫版本 ${INDEX.fetchedAt.slice(0, 10)}（${INDEX.total} 部）` : '尚未下載法規庫';
     const where = HOST === '0.0.0.0' ? `區網開放　埠 ${PORT}（請用本機區網 IP 連線）` : `http://${HOST}:${PORT}`;
