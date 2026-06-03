@@ -70,6 +70,8 @@ body {
   border: 1px solid var(--line); background: var(--panel); }
 .summary-banner.has-changes { background: var(--changed-bg); border-color: var(--changed-line); }
 .summary-banner.no-changes { background: #eef6f0; border-color: #bcd9c6; color: var(--ok); }
+.notice-banner { padding: 10px 14px; border-radius: var(--radius); margin-bottom: 14px; font-size: 13px; line-height: 1.6;
+  background: #fff8e6; border: 1px solid #f0d9a0; color: #7a5b00; }
 
 /* Add law */
 .addbar { position: relative; margin-bottom: 12px; }

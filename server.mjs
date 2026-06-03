@@ -145,7 +145,7 @@ function parseAmendmentDates(text) {
   return [...new Set(out)].sort();
 }
 // ymd 正規化：'2026-05-31' / '20260531' → '20260531'
-function ymdNorm(s) { return s ? String(s).replace(/\D/g, '').slice(0, 8) : ''; }
+function ymdNorm(s) { const d = s ? String(s).replace(/\D/g, '') : ''; return d.length === 8 ? d : ''; }  // 僅接受剛好 8 碼(西元YYYYMMDD)；像 2026/5/31→「2026531」這種不合法輸入直接視為空，避免存成壞日期
 // 截至某日（含）為止，最新一版的日期
 function asOfDate(pcode, ymd) {
   if (!ymd) return '';
@@ -978,12 +978,15 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const name = (body.name || '').trim();
       if (!name) return sendJSON(res, 400, { error: '請輸入任務名稱' });
+      const baselineDate = ymdNorm(body.baselineDate) || null;
+      const nextBaselineDate = ymdNorm(body.nextBaselineDate) || null;
+      if (baselineDate && nextBaselineDate && baselineDate > nextBaselineDate) return sendJSON(res, 400, { error: '前次查核基準日不可晚於下次查核基準日' });
       return await lockGroups(async () => {
         const db = await loadGroups();
         const group = {
           id: newId(), name, note: (body.note || '').trim(),
-          baselineDate: ymdNorm(body.baselineDate) || null,          // 前次查核基準日（可空＝第一次查核）
-          nextBaselineDate: ymdNorm(body.nextBaselineDate) || null,  // 下次查核基準日
+          baselineDate,                                              // 前次查核基準日（可空＝第一次查核）
+          nextBaselineDate,                                          // 下次查核基準日
           frequencyMonths: clampFreq(body.frequencyMonths),        // 查核頻率（月，已防呆）
           lagDays: body.lagDays != null ? Number(body.lagDays) : DEFAULT_LAG_DAYS,
           watchlist: [], state: {}, history: [],
@@ -1007,6 +1010,7 @@ const server = http.createServer(async (req, res) => {
           if (body.note != null) g.note = String(body.note).trim();
           if (body.baselineDate !== undefined) g.baselineDate = ymdNorm(body.baselineDate) || null;
           if (body.nextBaselineDate !== undefined) g.nextBaselineDate = ymdNorm(body.nextBaselineDate) || null;
+          if (g.baselineDate && g.nextBaselineDate && g.baselineDate > g.nextBaselineDate) return sendJSON(res, 400, { error: '前次查核基準日不可晚於下次查核基準日' });
           if (body.frequencyMonths != null) g.frequencyMonths = clampFreq(body.frequencyMonths);
           if (body.lagDays != null) g.lagDays = Number(body.lagDays);
           if (body.paused != null) g.paused = !!body.paused;     // 停用／恢復（紀錄保留）
@@ -1161,7 +1165,13 @@ async function start() {
   backupGroups().catch(() => {});   // 啟動時先備份一次：即使當天無任何變更，也確保有一份當日快照（防護：永不影響啟動）
   // 首次部署（完全沒有本機索引）：背景先把法規庫抓下來，使用者還在建任務／加法規時就準備好，避免在下載前把真法規誤標成「應手動查詢」。
   // 只在「索引完全不存在」時做；已有索引者維持原本「查核時才更新」模式，不會每次啟動都重抓。
-  if (!INDEX) { console.log('  首次啟動：背景下載法規資料庫中…（完成後法規會自動就緒）'); ensureFreshIndex().catch(() => {}); }
+  if (!INDEX) {
+    console.log('  首次啟動：背景下載法規資料庫中…（完成後法規會自動就緒）');
+    const tryDownload = (n) => ensureFreshIndex().catch(() => {}).then(() => {
+      if (!INDEX && n < 10) setTimeout(() => tryDownload(n + 1), 60000);   // 下載失敗(離線/防火牆)→ 每分鐘重試，最多 10 次；之後使用者可用同步狀態列手動重抓
+    });
+    tryDownload(0);
+  }
   // 內建排程器：①啟動後 4 秒補做一次（涵蓋停機/重啟期間錯過的，會自動補完多期）；
   // ②每天 CHECK_HOUR:05（本機時間）跑一次——挑「9 點剛過」是因為任務正是在執行查核日當天 9 點跨過到期門檻，這時動作當天上午就完成。
   if (CHECK_HOUR >= 0 && CHECK_HOUR <= 23) {

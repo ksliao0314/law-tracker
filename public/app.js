@@ -153,6 +153,7 @@ function renderDetail() {
       <div class="m"><b>追蹤數</b>${g.watchlist.length} 部</div>
       <div class="m"><b>上次執行</b>${g.lastCheckedAt ? fmtTime(g.lastCheckedAt) : '—'}</div>
     </div>
+    ${(!paused && !g.nextBaselineDate) ? `<div class="notice-banner">尚未設定「下次查核基準日」，此任務<b>不會自動查核</b>。按右上「編輯」設定後，系統會在「基準日＋3 天」的上午自動查核。</div>` : ''}
     ${paused ? '' : banner}
     ${renderLawTable(g)}
     ${renderManualTable(g)}
@@ -192,17 +193,28 @@ function renderLawTable(g) {
 // 不在批次資料庫中的法規 → 需手動查核，獨立區塊置於最後。
 // 純存檔：使用者手動查到該法「前次修正日期」後自填，不做異動比對、不標狀態。
 function renderManualTable(g) {
-  const list = g.watchlist.filter((l) => !l.current);
-  if (!list.length) return '';
+  const isManual = (l) => l.manual || String(l.pcode).startsWith('MANUAL-');
+  let manual = g.watchlist.filter((l) => !l.current && isManual(l));            // 使用者自建的手動查核項目
+  const pending = g.watchlist.filter((l) => !l.current && !isManual(l));        // 真法規但目前無 current（搜尋加入的）
+  let pre = '';
+  if (pending.length) {
+    if (!state.db) {
+      // 索引尚未載入（首次部署下載中）→ 這些真法規只是還沒就緒，下載完成會自動歸位，不是「需手動查核」
+      pre = `<div class="manual-section"><p class="muted manual-hint">⏳ 法規資料庫準備中，${pending.length} 部法規待就緒——下載完成後會自動歸入上方追蹤清單，無須處理。</p></div>`;
+    } else {
+      manual = manual.concat(pending);   // 索引已載入仍無 current＝確實不在批次資料庫（如公告／附表）→ 併入手動清單
+    }
+  }
+  if (!manual.length) return pre;
   const di = (d) => (d && String(d).length === 8) ? `${String(d).slice(0, 4)}-${String(d).slice(4, 6)}-${String(d).slice(6, 8)}` : '';
-  const rows = list.slice().sort((a, b) => a.name.localeCompare(b.name, 'zh-Hant')).map((l) =>
+  const rows = manual.slice().sort((a, b) => a.name.localeCompare(b.name, 'zh-Hant')).map((l) =>
     `<tr>
       <td>${esc(l.name)}</td>
       <td><input type="date" class="manual-date" data-mr-pcode="${esc(l.pcode)}" value="${di(l.manualDate)}"></td>
     </tr>`
   ).join('');
-  return `<div class="manual-section">
-    <h3>需手動查核 <span class="muted">（${list.length} 部）</span></h3>
+  return pre + `<div class="manual-section">
+    <h3>需手動查核 <span class="muted">（${manual.length} 部）</span></h3>
     <p class="muted manual-hint">這些法規不在全國法規資料庫批次資料中，系統無法自動比對；請手動查詢後，把該法的「前次修正日期」填在右欄存檔（自動儲存，無須每次填，有更新再改即可）。</p>
     <table class="laws manual">
       <thead><tr><th>法規名稱</th><th>前次修正日期</th></tr></thead>
