@@ -121,10 +121,9 @@ function renderDetail() {
     const dataDate = last.dbDate ? `　<span class="muted">· 資料基準 ${last.dbDate.slice(0, 10)}</span>` : '';
     const staleNote = last.stale ? `　<span class="stale-note">⚠ 該次未能更新最新資料</span>` : '';
     const isPrev = last.official === false;
-    const runTag = isPrev ? '<span class="run-tag preview">試算</span>' : '<span class="run-tag official">例行</span>';
     const prevNote = isPrev ? '　<span class="muted">· 參考用，未更新基準日</span>' : '';
-    banner = `<div class="summary-banner ${isPrev ? 'preview' : (c > 0 ? 'has-changes' : 'no-changes')}">
-      ${runTag} ${isPrev ? '試算於' : '上次查核'} ${fmtTime(last.checkedAt)}：${bits.join(' · ') || '尚無資料'}${dataDate}${staleNote}${prevNote}</div>`;
+    banner = `<div class="summary-banner ${c > 0 ? 'has-changes' : 'no-changes'}">
+      <span class="run-tag official">例行</span> 上次查核 ${fmtTime(last.checkedAt)}：${bits.join(' · ') || '尚無資料'}${dataDate}${staleNote}${prevNote}</div>`;
   }
 
   const paused = !!g.paused;
@@ -229,7 +228,7 @@ function renderHistory(g) {
     const changed = run.changes.filter((c) => c.kind === 'changed');
     const lines = changed.map((c) => `<div class="hist-change"><button class="btn-link" data-act="diff" data-pcode="${c.pcode}" data-name="${esc(c.name)}">${esc(c.name)}</button> <span class="muted">${ymdShort(c.from)}</span> <span class="arrow">→</span> ${ymdShort(c.to)}</div>`).join('')
       || `<div class="muted" style="padding:6px 0">本期間無異動。</div>`;
-    const runTag = run.official === false ? '<span class="run-tag preview">試算</span>' : '<span class="run-tag official">例行</span>';
+    const runTag = '<span class="run-tag official">例行</span>';
     const period = run.baseDate ? `${ymdShort(run.baseDate)} → ${ymdShort(run.cutoffDate)}` : `基準日 ${ymdShort(run.cutoffDate)}（首次）`;
     return `<div class="hist-item ${i === 0 ? 'open' : ''}" data-hist="${i}">
       <div class="hist-head" data-act="toggleHist">
@@ -317,7 +316,7 @@ async function doCheck(g) {
       else if (periods > 1) toast(`✓ 已補做 ${periods} 期至 ${ymdShort(run.cutoffDate)}，共 ${totalChanged} 部異動`);
       else toast(`✓ 已完成新一期查核：基準日更新為 ${ymdShort(run.cutoffDate)}（異動 ${run.summary.changed} 部）`);
     } else {
-      toast(`試算完成（僅供參考，未更新基準日）${run && run.summary.changed > 0 ? '：' + run.summary.changed + ' 部有異動' : ''}`);
+      toast(`查核完成（僅供參考，未更新基準日）${run && run.summary.changed > 0 ? '：' + run.summary.changed + ' 部有異動' : ''}`);
     }
   } catch (e) { state.checking = false; toast(e.message, true); if (btn) { btn.disabled = false; btn.textContent = '執行查核'; } }
 }
