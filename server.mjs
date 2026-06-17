@@ -5,7 +5,7 @@
 // 每部法規的 LawModifiedDate（西元 YYYYMMDD）即「最新修正日期」。
 
 import http from 'node:http';
-import { readFile, writeFile, rename, mkdir, readdir, unlink } from 'node:fs/promises';
+import { readFile, writeFile, rename, mkdir, readdir, unlink, stat } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -530,7 +530,9 @@ async function lyReasons(pcode, name, ymd) {
   if (cache[key]) return { ...cache[key], status: 'ok' };
   const result = { articles: {}, bill: null, status: 'none' };   // none＝查得到但本次修正無對應立法理由（不需重試）
   try {
-    const code = await lyLawCode(name);
+    const map = await lyLawMap();
+    if (!map) { result.status = 'failed'; return result; }   // 立法理由索引尚未建好(首次部署/背景重建中)→ 標為可重試，別誤判成「查無對應立法理由」
+    const code = map[name] || null;
     if (code) {
       const d = await lyJson(LY_API + '/v2/bills?' + new URLSearchParams({ ['法律編號']: code, ['議案狀態']: '三讀', limit: '60' }));
       const bills = (d.bills || []).map((b) => ({ no: b['議案編號'], date: billDateYmd(b['議案編號']), name: b['議案名稱'] })).filter((b) => b.date);
@@ -825,9 +827,12 @@ async function backupGroups() {
       const all = await readdir(BACKUP_DIR);
       const dated = all.filter((f) => /^groups-\d{8}\.json$/.test(f)).sort();   // 零填日期 → 字典序＝時間序
       for (const f of dated.slice(0, Math.max(0, dated.length - BACKUP_KEEP))) await unlink(path.join(BACKUP_DIR, f)).catch(() => {});
-      // 清掉先前崩潰/中斷殘留的 .tmp 暫存檔（修剪 regex 不含 .tmp，否則會無限累積）；排除本行程正在寫的暫存檔以免誤刪
-      const mine = `.tmp-${process.pid}-`;
-      for (const f of all.filter((f) => /^groups-\d{8}\.json\.tmp-/.test(f) && !f.includes(mine))) await unlink(path.join(BACKUP_DIR, f)).catch(() => {});
+      // 清掉先前崩潰/中斷殘留的 .tmp 暫存檔（修剪 regex 不含 .tmp，否則會無限累積）；以 mtime 判斷
+      // (超過 60 秒＝確定是孤兒，因 tmp→rename 為毫秒級)，可同時涵蓋 pid 重用的邊界、又不會誤刪正在寫的暫存檔
+      const cutoff = Date.now() - 60000;
+      for (const f of all.filter((f) => /^groups-\d{8}\.json\.tmp-/.test(f))) {
+        try { const s = await stat(path.join(BACKUP_DIR, f)); if (s.mtimeMs < cutoff) await unlink(path.join(BACKUP_DIR, f)).catch(() => {}); } catch {}
+      }
     } catch { /* 修剪盡力而為，不影響已寫入的備份 */ }
   } catch (e) {
     LAST_BACKUP = { at: new Date().toISOString(), ok: false, error: String(e.message || e) };
@@ -913,9 +918,10 @@ function sendJSON(res, code, obj) {
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
+    if (Number(req.headers['content-length'] || 0) > 5e6) { const e = new Error('請求內容過大（上限 5MB）'); e.tooLarge = true; req.pause(); return reject(e); }   // 有宣告 Content-Length 就提早拒絕，免先緩衝 5MB
     let data = '', done = false;
     const fail = (e) => { if (!done) { done = true; reject(e); } };          // 確保 Promise 一定有結果，避免請求卡死
-    req.on('data', (c) => { data += c; if (data.length > 5e6) { fail(new Error('請求內容過大')); req.destroy(); } });
+    req.on('data', (c) => { data += c; if (data.length > 5e6 && !done) { const e = new Error('請求內容過大（上限 5MB）'); e.tooLarge = true; req.pause(); fail(e); } });   // 暫停(停止累積)而非 destroy，讓外層能先回 413 給客戶端
     req.on('end', () => { if (done) return; done = true; try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
     req.on('error', fail);
     req.on('close', () => fail(new Error('連線中斷')));                       // destroy()/中斷只發 close，不發 end → 在此收尾
@@ -1147,14 +1153,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     if ((mm = p.match(/^\/api\/laws\/([^/]+)\/diff\.docx$/)) && m === 'GET') {
-      const diff = await buildDiff(decodeURIComponent(mm[1]));
-      const buf = buildDocx(diff);
-      const fname = encodeURIComponent(`${diff.name}_新舊對照表_${diff.newDate}.docx`);
-      res.writeHead(200, {
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'Content-Disposition': `attachment; filename*=UTF-8''${fname}`,
-      });
-      return res.end(buf);
+      try {
+        const diff = await buildDiff(decodeURIComponent(mm[1]));
+        const buf = buildDocx(diff);
+        const fname = encodeURIComponent(`${diff.name}_新舊對照表_${diff.newDate}.docx`);
+        res.writeHead(200, {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'Content-Disposition': `attachment; filename*=UTF-8''${fname}`,
+        });
+        return res.end(buf);
+      } catch (e) {   // 此路由是「另開分頁」的直接連結 → 失敗時回友善 HTML，而非讓使用者看到原始 JSON
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(`<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;max-width:600px;margin:60px auto;padding:0 20px;color:#333;line-height:1.7"><h3>無法匯出 Word 對照表</h3><p>${xmlEsc(e.message)}</p><p style="color:#888">請回工具頁，先確認此法規能正常顯示「新舊對照」後再匯出。</p></body>`);
+      }
     }
 
     if (p.startsWith('/api/')) return sendJSON(res, 404, { error: '未知的 API' });
@@ -1162,6 +1173,10 @@ const server = http.createServer(async (req, res) => {
     // ---- 靜態檔 ----
     return await serveStatic(res, p);
   } catch (e) {
+    if (e && e.tooLarge) {   // 請求體過大：在連線關閉前先回 413（Connection: close 讓未讀完的 body 不影響後續），而非讓客戶端只收到連線重置
+      try { if (!res.writableEnded && !res.destroyed) { res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8', 'Connection': 'close' }); res.end(JSON.stringify({ error: '請求內容過大（上限 5MB）' })); } } catch {}
+      return;
+    }
     return sendJSON(res, 500, { error: String(e.message || e) });
   }
 });
