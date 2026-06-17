@@ -57,7 +57,7 @@ function toast(msg, isErr) {
 // ── 載入與渲染 ──────────────────────────────────────
 async function load() {
   const data = await api('/api/state');
-  state.db = data.db; state.sync = data.sync; state.refreshing = data.refreshing; state.groups = data.groups;
+  state.db = data.db; state.sync = data.sync; state.refreshing = data.refreshing; state.groups = data.groups; state.backup = data.backup;
   if (state.selectedId && !state.groups.find((g) => g.id === state.selectedId)) state.selectedId = null;
   if (!state.selectedId && state.groups.length) state.selectedId = state.groups[0].id;
   renderGroups(); renderDetail(); renderSyncStatus(); watchIndexReady();
@@ -70,19 +70,22 @@ function watchIndexReady() {
   clearTimeout(state._idxTimer);
   if (state.db && !state.refreshing) { _idxPolls = 0; return; }            // 索引已就緒 → 停止輪詢
   if (!state.refreshing && state.sync && state.sync.error) return;          // 下載失敗 → 停止，由同步狀態列顯示錯誤供手動重試
-  if (_idxPolls++ > 80) return;                                            // 上限約 200 秒，避免離線時無限輪詢
+  if (_idxPolls++ > 240) return;                                           // 上限約 10 分鐘，涵蓋首次下載失敗的背景重試窗(每分鐘×10)，避免太早停止而卡在「準備中」；仍有上限以免離線時無限輪詢
   state._idxTimer = setTimeout(() => load().catch(() => {}), 2500);
 }
 // 資料同步狀態（角落）：正常時低調、失敗或過期時明顯並可點擊重試
 function renderSyncStatus() {
   const el = document.getElementById('syncStatus'); if (!el) return;
   const s = state.sync || {};
-  if (state.refreshing && !state.db) { el.innerHTML = `<span class="sync stale"><span class="spinner"></span>　法規資料庫準備中…（首次啟動，完成後法規自動就緒）</span>`; return; }
-  if (state.refreshing) { el.innerHTML = `<span class="sync stale"><span class="spinner"></span>　更新法規資料庫中…</span>`; return; }
-  if (s.error) el.innerHTML = `<span class="sync err" data-act="resync" title="${esc(s.error)}">⚠ 資料同步失敗，點此重試</span>`;
-  else if (s.fresh) el.innerHTML = `<span class="sync ok">✓ 資料已同步</span>`;
-  else if (s.fetchedAt) el.innerHTML = `<span class="sync stale" data-act="resync">資料基準 ${s.fetchedAt.slice(0, 10)}（點此更新）</span>`;
-  else el.innerHTML = `<span class="sync stale" data-act="resync">尚未下載法規庫（點此下載）</span>`;
+  let html;
+  if (state.refreshing && !state.db) html = `<span class="sync stale"><span class="spinner"></span>　法規資料庫準備中…（首次啟動，完成後法規自動就緒）</span>`;
+  else if (state.refreshing) html = `<span class="sync stale"><span class="spinner"></span>　更新法規資料庫中…</span>`;
+  else if (s.error) html = `<span class="sync err" data-act="resync" title="${esc(s.error)}">⚠ 資料同步失敗，點此重試</span>`;
+  else if (s.fresh) html = `<span class="sync ok">✓ 資料已同步</span>`;
+  else if (s.fetchedAt) html = `<span class="sync stale" data-act="resync">資料基準 ${s.fetchedAt.slice(0, 10)}（點此更新）</span>`;
+  else html = `<span class="sync stale" data-act="resync">尚未下載法規庫（點此下載）</span>`;
+  if (state.backup && state.backup.ok === false) html += `　<span class="sync err" title="${esc(state.backup.error || '')}">⚠ 資料備份失敗（請檢查磁碟／權限）</span>`;   // 救命備份失效要讓使用者看得到
+  el.innerHTML = html;
 }
 
 function renderGroups() {
@@ -257,7 +260,7 @@ document.getElementById('detail').addEventListener('click', async (e) => {
   if (act === 'pause') return pauseGroup(g, true);
   if (act === 'resume') return pauseGroup(g, false);
   if (act === 'delGroup') return delGroup(g);
-  if (act === 'diff') { const pc = actEl.dataset.pcode, nm = actEl.dataset.name; markReviewed(g, pc); return showDiff(pc, nm); }
+  if (act === 'diff') { const pc = actEl.dataset.pcode, nm = actEl.dataset.name; return showDiff(pc, nm).then((shown) => { if (shown) markReviewed(g, pc); }); }   // 對照成功顯示後才標記已閱(失敗不清掉側欄「有異動」)
   if (act === 'toggleHist') { actEl.closest('.hist-item').classList.toggle('open'); return; }
   const ln = e.target.closest('.law-name'); if (ln && ln.dataset.pcode) return showHistory(ln.dataset.pcode, ln.dataset.name);
 });
@@ -366,9 +369,11 @@ async function showDiff(pcode, name) {
     const d = await api(`/api/laws/${encodeURIComponent(pcode)}/diff`);
     const body = document.getElementById('diffBody');
     if (body) body.innerHTML = renderDiff(d);
+    return true;
   } catch (e) {
     const body = document.getElementById('diffBody');
     if (body) body.innerHTML = `<p class="muted">${esc(e.message)}</p><p style="margin-top:12px"><button class="btn" data-act="retryDiff" data-pcode="${esc(pcode)}" data-name="${esc(name || '')}">🔄 重試</button></p>`;
+    return false;   // 載入失敗 → 不應標記為已閱
   }
 }
 function cnum(n) {

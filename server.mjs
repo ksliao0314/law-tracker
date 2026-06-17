@@ -34,7 +34,7 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) LawTracker/1.0';
 const PORT = Number(process.env.PORT) || 7843;
 const HOST = process.env.HOST || '127.0.0.1';                 // 本機＝127.0.0.1；常駐伺服器要開放區網可設 0.0.0.0
 // 「執行查核日」當天、本地時間幾點後算正式查核（台灣 9 點）；內建排程器也固定在這個時點（每天一次）動作，兩者永遠一致。
-const CHECK_HOUR = process.env.CHECK_HOUR != null ? Number(process.env.CHECK_HOUR) : 9; // 設為 0–23 以外即關閉排程器（僅開頁時查核）
+const CHECK_HOUR = process.env.CHECK_HOUR != null ? Math.floor(Number(process.env.CHECK_HOUR)) : 9; // 取整(避免 9.5 這類使排程 9:05 觸發但 isDueNow 永遠不到期)；設為 0–23 以外即關閉排程器（僅開頁時查核）
 // 保留最近幾份每日備份：未設或填了非數字（手誤）→ 退回預設 30，不讓「備份」這種保命功能被打字錯誤靜默關掉；明確填 0（或負數）才關閉。
 const _bkKeepRaw = process.env.BACKUP_KEEP;
 const _bkKeepNum = Number(_bkKeepRaw);
@@ -93,11 +93,12 @@ async function readJSON(file, fallback) {
   try { return JSON.parse(await readFile(file, 'utf8')); }
   catch { return fallback; }
 }
+let _wjSeq = 0;
 async function writeJSONAtomic(file, obj) {
   await mkdir(path.dirname(file), { recursive: true });
-  const tmp = file + '.tmp-' + process.pid;
+  const tmp = `${file}.tmp-${process.pid}-${++_wjSeq}-${Math.random().toString(36).slice(2, 8)}`;   // 唯一暫存名：避免同檔並發寫入(如多個新舊對照同時 archiveArticles)互撞同一 tmp → rename ENOENT 崩潰
   await writeFile(tmp, JSON.stringify(obj), 'utf8');
-  await rename(tmp, file);
+  try { await rename(tmp, file); } catch (e) { await unlink(tmp).catch(() => {}); throw e; }
 }
 
 // ──────────────────────────────────────────────────────────
@@ -145,7 +146,13 @@ function parseAmendmentDates(text) {
   return [...new Set(out)].sort();
 }
 // ymd 正規化：'2026-05-31' / '20260531' → '20260531'
-function ymdNorm(s) { const d = s ? String(s).replace(/\D/g, '') : ''; return d.length === 8 ? d : ''; }  // 僅接受剛好 8 碼(西元YYYYMMDD)；像 2026/5/31→「2026531」這種不合法輸入直接視為空，避免存成壞日期
+function ymdNorm(s) {   // 僅接受合法的西元 8 碼日期；2026/5/31(7碼)、2026-02-30、20261345 這類一律視為空，避免存成壞日期
+  const d = s ? String(s).replace(/\D/g, '') : '';
+  if (d.length !== 8) return '';
+  const y = +d.slice(0, 4), m = +d.slice(4, 6), da = +d.slice(6, 8);
+  const dt = new Date(y, m - 1, da);
+  return (dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === da) ? d : '';   // 真實曆日驗證(擋 2/30、13 月、00000000)
+}
 // 截至某日（含）為止，最新一版的日期
 function asOfDate(pcode, ymd) {
   if (!ymd) return '';
@@ -168,6 +175,7 @@ function todayYmd() { const d = new Date(); return String(d.getFullYear()) + Str
 // 查核頻率(月)防呆：負數→0(不定期)、小數無條件捨去、超大值設上限(1200 月)、非數字→0；
 // 避免從 API／手改 groups.json 灌入負數或小數，讓 addMonths 把下次基準日倒推或算出亂碼日期(任務永遠到期空轉)。
 function clampFreq(v) { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(0, Math.min(1200, n)) : 0; }
+function clampLag(v) { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(0, Math.min(60, n)) : DEFAULT_LAG_DAYS; }   // 資料上網落差天數防呆：負數→0、小數捨去、上限 60、非數字→預設(避免 NaNNaNNaN 使任務永遠不到期)
 function dueYmd(group) { const n = ymdNorm(group.nextBaselineDate); if (!n) return ''; return addDays(n, group.lagDays ?? DEFAULT_LAG_DAYS); }
 // 是否已到「執行查核日」可做正式查核：超過執行查核日→是；當天→上午 9 點後才算（避免資料尚未上線）。
 function isDueNow(group) {
@@ -261,6 +269,9 @@ async function refreshIndex() {
       fetchedAt: new Date().toISOString(),
       lawCount, orderCount, total: lawCount + orderCount,
       laws,
+      // 此次下載「已嘗試建快照」的追蹤法規 → 各自當時的現行版本日。供 watchedMissingSnapshot 判斷：
+      // 已針對某法現行版本嘗試過(有條文就建了；廢止/批次無條文則建不出)就不必每次查核重抓整個法規庫。
+      snapshotAttempted: Object.fromEntries([...watched].map((pc) => [pc, (laws[pc] && laws[pc].modifiedDate) || ''])),
     };
     await writeJSONAtomic(INDEX_PATH, index);
     await writeJSONAtomic(HISTORIES_PATH, histories);
@@ -294,6 +305,7 @@ function indexIsFresh() {
 // 缺了新舊對照會失敗(尚無條文快照)，所以查核時若偵測到缺，就再下載一次補建(涵蓋首次部署、以及在索引已是當日最新的日子新加法規)。
 async function watchedMissingSnapshot() {
   if (!INDEX) return false;                                      // 沒索引時無從判斷，交由索引下載本身處理
+  const attempted = INDEX.snapshotAttempted || {};
   try {
     const db = await loadGroups();
     for (const g of db.groups) {
@@ -301,6 +313,7 @@ async function watchedMissingSnapshot() {
         if (l.manual || String(l.pcode).startsWith('MANUAL-')) continue;   // 手動項目不需快照
         const meta = lawMeta(l.pcode);
         if (!meta || !meta.modifiedDate) continue;               // 不在索引的法規本就無快照可建，略過
+        if (attempted[l.pcode] === meta.modifiedDate) continue;  // 上次下載已針對此「現行版本」嘗試建快照(廢止/無條文則建不出，重抓也沒用)→ 不再每次重抓
         const snap = await readJSON(path.join(ARTICLES_DIR, l.pcode + '.json'), null);
         if (!snap || !snap.versions || !snap.versions[meta.modifiedDate]) return true;
       }
@@ -313,7 +326,11 @@ async function ensureFreshIndex() {
   if (refreshing) return;                                         // 等待逾時仍在下載 → 不重複觸發
   if (indexIsFresh() && !(await watchedMissingSnapshot())) return; // 當日已抓且追蹤法規快照齊全 → 免重抓；缺快照(剛加入/首次部署)則再抓一次補建
   try { await refreshIndex(); LAST_SYNC = { at: new Date().toISOString(), ok: true }; }
-  catch (e) { LAST_SYNC = { at: new Date().toISOString(), ok: false, error: String(e.message || e) }; if (!INDEX) throw e; /* 有舊索引就沿用，不阻斷查核 */ }
+  catch (e) {
+    const msg = String(e.message || e);
+    if (/已有更新作業進行中/.test(msg)) { for (let i = 0; refreshing && i < 300; i++) await sleep(300); return; }   // 並發 TOCTOU 撞上別人正在下載 → 等它完成即可，不算同步失敗(不要在 UI 顯示假錯誤)
+    LAST_SYNC = { at: new Date().toISOString(), ok: false, error: msg }; if (!INDEX) throw e; /* 有舊索引就沿用，不阻斷查核 */
+  }
 }
 // 資料同步狀態（供 UI 顯示資料是否最新、上次同步是否失敗）
 function syncMeta() {
@@ -698,7 +715,7 @@ function zipStore(files) {
   eocd.writeUInt32LE(cdBuf.length, 12); eocd.writeUInt32LE(cdStart, 16);
   return Buffer.concat([...parts, cdBuf, eocd]);
 }
-function xmlEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function xmlEsc(s) { return String(s == null ? '' : s).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }  // 先濾掉 XML 1.0 非法控制字元(否則 Word 無法開啟)，再做實體跳脫
 function wRun(text, o = {}) {
   const r = [];
   if (o.color) r.push(`<w:color w:val="${o.color}"/>`);
@@ -773,8 +790,16 @@ function buildDocx(diff) {
 // 群組與查核
 // ──────────────────────────────────────────────────────────
 async function loadGroups() {
-  const db = await readJSON(GROUPS_PATH, { version: 1, groups: [] });
-  if (!db || !Array.isArray(db.groups)) return { version: 1, groups: [] };   // 防護：損壞的 groups.json 不致讓所有 API 壞掉
+  let raw;
+  try { raw = await readFile(GROUPS_PATH, 'utf8'); }
+  catch (e) {
+    if (e.code === 'ENOENT') return { version: 1, groups: [] };   // 檔案真的不存在(首次安裝)→空清單，正常
+    throw new Error('讀取 groups.json 失敗（' + (e.code || e.message) + '）—— 已中止此操作，以免用空資料覆蓋真檔，請稍後再試');   // 暫時讀不到(權限/IO/iCloud 未同步)→中止，絕不覆蓋
+  }
+  let db;
+  try { db = JSON.parse(raw); }
+  catch { throw new Error('groups.json 解析失敗（檔案可能損壞）—— 已中止以保護資料，可從 data/backups 還原'); }   // 損壞→中止，由備份還原，不以空覆蓋
+  if (!db || !Array.isArray(db.groups)) return { version: 1, groups: [] };
   return db;
 }
 async function saveGroups(db) { await writeJSONAtomic(GROUPS_PATH, db); await backupGroups(); }
@@ -788,6 +813,7 @@ async function backupGroups() {
   try {
     const raw = await readFile(GROUPS_PATH, 'utf8').catch(() => null);
     if (!raw || raw.trim().length < 2) return;                     // 全新安裝、尚無資料 → 不備份
+    try { const p = JSON.parse(raw); if (!p || !Array.isArray(p.groups)) return; } catch { return; }   // 損壞檔不備份，避免覆蓋掉前一份正常的當日備份
     await mkdir(BACKUP_DIR, { recursive: true });
     const file = `groups-${todayYmd()}.json`;
     const dest = path.join(BACKUP_DIR, file);
@@ -843,7 +869,7 @@ function runCheck(group, now, official) {
   for (const law of group.watchlist) {
     const meta = lawMeta(law.pcode);
     if (!meta) { changes.push({ pcode: law.pcode, name: law.name, from: null, to: null, kind: 'missing', abolished: false }); continue; }
-    const toDate = asOfDate(law.pcode, cutoffYmd) || meta.modifiedDate || '';
+    const toDate = asOfDate(law.pcode, cutoffYmd) || '';   // 不再退回 meta.modifiedDate：沿革缺漏且現行版本晚於基準日時，該版本不屬本期(asOfDate 已含「現值≤基準日才採用」的正確退路)，否則會把未來版本誤算進本期、期間張冠李戴
     // 比對起點＝該法「上次正式查核所記錄的版本」(baseVersion)。如此，某次因資料晚上線而漏抓的修正，
     // 會在下一期被自然抓到（因為 baseVersion 仍停在舊版）。舊資料未記錄版本時，退回以前次基準日推算。
     let fromV;
@@ -955,7 +981,7 @@ const server = http.createServer(async (req, res) => {
           }),
         };
       });
-      return sendJSON(res, 200, { db: dbMeta(), sync: syncMeta(), refreshing, today, groups });
+      return sendJSON(res, 200, { db: dbMeta(), sync: syncMeta(), refreshing, today, groups, backup: LAST_BACKUP });
     }
 
     if (p === '/api/db/refresh' && m === 'POST') {
@@ -988,7 +1014,7 @@ const server = http.createServer(async (req, res) => {
           baselineDate,                                              // 前次查核基準日（可空＝第一次查核）
           nextBaselineDate,                                          // 下次查核基準日
           frequencyMonths: clampFreq(body.frequencyMonths),        // 查核頻率（月，已防呆）
-          lagDays: body.lagDays != null ? Number(body.lagDays) : DEFAULT_LAG_DAYS,
+          lagDays: body.lagDays != null ? clampLag(body.lagDays) : DEFAULT_LAG_DAYS,
           watchlist: [], state: {}, history: [],
           prevCheckedAt: null, lastCheckedAt: null, createdAt: new Date().toISOString(),
         };
@@ -1012,7 +1038,7 @@ const server = http.createServer(async (req, res) => {
           if (body.nextBaselineDate !== undefined) g.nextBaselineDate = ymdNorm(body.nextBaselineDate) || null;
           if (g.baselineDate && g.nextBaselineDate && g.baselineDate > g.nextBaselineDate) return sendJSON(res, 400, { error: '前次查核基準日不可晚於下次查核基準日' });
           if (body.frequencyMonths != null) g.frequencyMonths = clampFreq(body.frequencyMonths);
-          if (body.lagDays != null) g.lagDays = Number(body.lagDays);
+          if (body.lagDays != null) g.lagDays = clampLag(body.lagDays);
           if (body.paused != null) g.paused = !!body.paused;     // 停用／恢復（紀錄保留）
           delete g.frequencyDays;
           await saveGroups(db);

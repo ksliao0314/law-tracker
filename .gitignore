@@ -10,6 +10,8 @@ data/ly-laws.json
 data/ly-reasons.json
 data/gazette.json
 data/articles/
+# 原子寫檔的暫存檔（崩潰殘留；可能含當事人名稱）── 一律不上傳
+data/*.tmp-*
 # 例外：保留搜尋用的種子目錄（公開、CC0 開放資料，讓首次 clone 即可搜尋）
 !data/pcode_all.json
 

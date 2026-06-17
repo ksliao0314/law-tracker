@@ -37,9 +37,9 @@ cat > "$PLIST" <<EOF
   <key>WorkingDirectory</key><string>$PROJ_X</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PORT</key><string>$PORT</string>
-    <key>HOST</key><string>$HOST</string>
-    <key>CHECK_HOUR</key><string>$CHECK_HOUR</string>
+    <key>PORT</key><string>$(xmlesc "$PORT")</string>
+    <key>HOST</key><string>$(xmlesc "$HOST")</string>
+    <key>CHECK_HOUR</key><string>$(xmlesc "$CHECK_HOUR")</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -50,7 +50,12 @@ cat > "$PLIST" <<EOF
 EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/tmp/lawtracker-bootstrap.err; then
+  echo "✗ 啟動服務失敗：$(cat /tmp/lawtracker-bootstrap.err 2>/dev/null)"
+  echo "  請先執行 service/uninstall-service.command 再安裝一次；若仍失敗，請回報上面訊息。"
+  rm -f /tmp/lawtracker-bootstrap.err; read -r -p "按 Enter 關閉…" _; exit 1
+fi
+rm -f /tmp/lawtracker-bootstrap.err
 launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
 echo "✓ 已安裝並啟動背景服務：$LABEL"
