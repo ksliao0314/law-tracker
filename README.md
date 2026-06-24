@@ -89,7 +89,31 @@ export HOST=0.0.0.0           # 開放區網（同事可連）
 - **Node 用 Homebrew 或官方安裝器安裝**（路徑如 `/opt/homebrew/bin/node`、`/usr/local/bin/node`）；常駐服務不建議用 nvm／asdf 等版本管理器的 Node（升級或移除該版本後服務可能失效）。
 - 關閉系統休眠（或設為永不睡眠），確保 24 小時都在。
 
-> ⚠️ **安全提醒**：本工具**預設沒有登入密碼**。模式 B 開放區網（`HOST=0.0.0.0`）等於「同一區網上任何裝置都能開啟並修改」資料。請僅在**信任的內部網路**使用，且**不要曝露到網際網路**（需要遠端請走 VPN／SSH 通道）。若需登入保護，可再加一組共用密碼（HTTP Basic）。
+> ⚠️ **安全提醒**：本工具**預設沒有登入密碼**。一旦設 `HOST=0.0.0.0`（開放區網／對外），任何能連到此服務的人都能讀取與修改當事人資料。**對外或多人使用務必設 `AUTH_PASS`**（見下方環境變數，啟用後瀏覽器會跳登入框）；放上網際網路請再加反向代理 ＋ HTTPS（見「模式 C」）。
+
+### 模式 C — Linux／GCP 雲端常駐（systemd）
+
+放在雲端 VM（如 GCP）讓人遠端使用：
+
+```bash
+# 只綁本機（建議搭反向代理對外）：
+bash service/install-systemd.sh
+# 直接對外 ／ 多人用 → 務必設共用密碼：
+HOST=0.0.0.0 AUTH_PASS='你的密碼' bash service/install-systemd.sh
+```
+
+安裝後開機自啟、當掉自動重啟；機密寫進 `/etc/lawtracker.env`（權限 600）。常用：狀態 `sudo systemctl status lawtracker`、日誌 `journalctl -u lawtracker -f`、健康檢查 `curl http://127.0.0.1:7843/healthz`、停止移除 `sudo systemctl disable --now lawtracker`。
+
+**雲端 VM 注意：**
+- **時區**：安裝腳本已在服務內設 `TZ=Asia/Taipei`，「早上 9 點查核」才正確（VM 預設 UTC 會讓查核變下午 5 點、跨日判斷整片偏移）。
+- **對外＋網域＋HTTPS**：別把 `7843` 直接開到網際網路。架反向代理自動上 TLS，例如 Caddy（自動 Let's Encrypt）：
+  ```
+  law.example.com {
+      reverse_proxy 127.0.0.1:7843
+  }
+  ```
+  搭配 `AUTH_PASS` 即可；要更強驗證可用 Cloudflare Tunnel ＋ Access（email 登入、不開對外埠）。
+- **記憶體**：每日下載法規庫尖峰約 650 MB。2 GB 以上的 VM 多半夠用；保險可加 1–2 GB swap。服務已設 `Restart=on-failure`，萬一被殺也會自動拉回。
 
 ---
 
@@ -118,6 +142,8 @@ export HOST=0.0.0.0           # 開放區網（同事可連）
 | `HOST` | `127.0.0.1` | 綁定位址。本機用預設；常駐開放區網設 `0.0.0.0` |
 | `CHECK_HOUR` | `9` | 每天自動查核的時點（本機時間整點；台灣設 `9`＝每天早上 9 點剛過就查當天到期任務，與「到期門檻」同一時間）。排程器固定每天一次、外加每次啟動補做。設 0–23 以外即關閉排程（僅開頁時查核） |
 | `BACKUP_KEEP` | `30` | 自動保留最近幾份 `data/groups.json` 每日備份（存於 `data/backups/`）。設 `0` 關閉備份 |
+| `AUTH_PASS` | （無） | 設定後啟用共用密碼登入（HTTP Basic，瀏覽器自動跳登入框）。**對外／多人務必設定**；未設＝本機單人免密碼 |
+| `TZ` | 系統時區 | 主機時區。雲端 VM 預設 UTC，台灣請設 `Asia/Taipei`（否則查核時點與跨日判斷會偏移；模式 C 安裝腳本已自動帶入） |
 
 ---
 

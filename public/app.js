@@ -435,6 +435,12 @@ function diffArticleBlock(kind, no, oldT, newT, reasons) {
 }
 function renderDiff(d) {
   const links = (d.links || []).map((l) => `<a href="${l.url}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('');
+  if (d.abolished) return `<div class="diff-head">
+      <div class="diff-title"><b>${esc(d.name)}</b> <span class="badge abolished">已廢止</span></div>
+      <div class="diff-meta">本法規已於 <b>${fmtDate(d.abolishDate).replace(/<[^>]+>/g, '')}</b> 廢止，無新舊條文可對照。</div>
+      ${d.amend && d.amend.docNo ? `<div class="diff-amend">廢止令：${esc(d.amend.docNo)}</div>` : ''}
+      <div class="diff-src">請點官方原文確認：<div class="diff-links">${links}</div></div>
+    </div>`;
   const amend = d.amend && (d.amend.date || d.amend.docNo || (d.amend.articlesMentioned || []).length)
     ? `<div class="diff-amend">沿革最新修正：${esc(d.amend.date || '')}${d.amend.docNo ? '　' + esc(d.amend.docNo) : ''}${(d.amend.articlesMentioned || []).length ? '　異動第 ' + esc(d.amend.articlesMentioned.join('、')) + ' 條' : ''}</div>`
     : '';

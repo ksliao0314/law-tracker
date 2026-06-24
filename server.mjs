@@ -464,8 +464,10 @@ function parseLatestAmendment(text) {
   if (!text) return null;
   const entries = [...text.matchAll(/(\d+)\.\s*([\s\S]*?)(?=\r?\n\s*\d+\.|$)/g)];
   if (!entries.length) return null;
-  let best = entries[0];
-  for (const e of entries) if (Number(e[1]) > Number(best[1])) best = e;
+  // 以「日期最大」挑最新一筆(編號僅作 tie-break)：官方沿革偶有編號錯亂，純按編號會挑到較舊版本
+  const ymdOf = (e) => { const dm0 = /中華民國(.+?年.+?月.+?日)/.exec(e[2]); return dm0 ? (parseRocDate(dm0[1]) || '') : ''; };
+  let best = entries[0], bestY = ymdOf(entries[0]);
+  for (const e of entries) { const y = ymdOf(e); if (y > bestY || (y === bestY && Number(e[1]) > Number(best[1]))) { best = e; bestY = y; } }
   const body = best[2].replace(/\s+/g, ' ').trim();
   const dm = /中華民國(.+?年.+?月.+?日)/.exec(body);
   const docm = /([^\s，；。]{2,}字第\s*[0-9A-Za-z]+\s*號|(?:總統|行政院)[^，；。]{0,12}令)/.exec(body);
@@ -568,6 +570,11 @@ async function buildDiff(pcode) {
   const meta = lawMeta(pcode);
   if (!meta) throw new Error('查無此法規（可能非全國法規資料庫範圍，例如公告／導則／附表）');
   const curDate = meta.modifiedDate;
+  if (meta.abolished) {   // 廢止法規：沒有「新版條文」可比對 → 回告知「已廢止」而非報「尚無快照」這種看似故障的錯誤
+    return { pcode, name: meta.name, level: meta.level, abolished: true, abolishDate: curDate,
+      amend: parseLatestAmendment(HISTORIES[pcode] || ''), modified: [], added: [], removed: [], changedCount: 0,
+      newDate: curDate, oldDate: '', oldSource: '', noPrior: true, links: officialLinks(pcode, meta) };
+  }
   const snap = await readJSON(path.join(ARTICLES_DIR, pcode + '.json'), null);
   const newArts = snap && snap.versions && snap.versions[curDate];
   if (!newArts) throw new Error('尚無此法規的條文快照，暫時無法比對新舊條文（此法規會在隨資料庫同步、建立快照後即可使用）。');
@@ -931,7 +938,9 @@ function readBody(req) {
 }
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
 async function serveStatic(res, urlPath) {
-  let rel = urlPath === '/' ? 'index.html' : decodeURIComponent(urlPath.slice(1));
+  let rel;
+  try { rel = urlPath === '/' ? 'index.html' : decodeURIComponent(urlPath.slice(1)); }
+  catch { res.writeHead(404); return res.end('not found'); }   // 畸形百分比編碼 → 404 而非 500
   const full = path.join(PUBLIC_DIR, rel);
   if (full !== PUBLIC_DIR && !full.startsWith(PUBLIC_DIR + path.sep)) { res.writeHead(403); return res.end('forbidden'); }
   try {
@@ -973,6 +982,7 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
   const m = req.method;
   try {
+    if (p === '/healthz' && m === 'GET') return sendJSON(res, 200, { ok: true, indexReady: !!INDEX, refreshing, fetchedAt: INDEX ? INDEX.fetchedAt : null });   // 健康檢查(免認證，供監控/負載平衡探測)
     // ---- 共用密碼閘(可選)：設了 AUTH_PASS 才啟用。給區網/公開部署最低限度防護；未設則維持本機單人免密碼。----
     if (AUTH_PASS) {
       const mm0 = /^Basic\s+(.+)$/i.exec(req.headers['authorization'] || '');
