@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
+import crypto from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, 'data');
@@ -39,6 +40,8 @@ const CHECK_HOUR = process.env.CHECK_HOUR != null ? Math.floor(Number(process.en
 const _bkKeepRaw = process.env.BACKUP_KEEP;
 const _bkKeepNum = Number(_bkKeepRaw);
 const BACKUP_KEEP = (_bkKeepRaw != null && _bkKeepRaw !== '' && Number.isFinite(_bkKeepNum)) ? _bkKeepNum : 30;
+const AUTH_PASS = process.env.AUTH_PASS || '';   // 設了才啟用共用密碼(Basic Auth)；未設＝維持現狀(本機單人免密碼)。區網/公開部署務必設定。
+let LAST_MANUAL_REFRESH = 0;                       // 手動「重試同步」節流時間戳(防反覆觸發 650MB 下載尖峰)
 
 // ──────────────────────────────────────────────────────────
 // ZIP 解壓（最小實作，支援 STORED + DEFLATE）
@@ -236,7 +239,7 @@ async function refreshIndex() {
     let lawCount = 0, orderCount = 0;
 
     // 被追蹤法規:更新時順手存一份「官方條文快照」,供日後新舊對照(免再抓網頁)
-    const groupsDb = await loadGroups();
+    const groupsDb = await loadGroups().catch(() => ({ version: 1, groups: [] }));   // best-effort：下載法規庫不需 groups(僅用於加值快照)；groups.json 暫時讀不到/損壞時不該阻斷整個下載
     const watched = new Set();
     for (const g of groupsDb.groups) for (const l of g.watchlist) watched.add(l.pcode);
     const snaps = [];
@@ -589,8 +592,7 @@ async function buildDiff(pcode) {
   // 舊版若來自歷史法規(固定寬度硬斷行)，重組回正確的項/款單元；批次來源則原樣不動
   if (!oldEmpty) oldArts = Object.fromEntries(Object.entries(oldArts).map(([k, v]) => [k, maybeDewrap(v)]));
   const diff = oldEmpty ? { modified: [], added: [], removed: [], changedCount: 0 } : diffArticles(oldArts, newArts);
-  const histories = await readJSON(HISTORIES_PATH, {});
-  const amend = parseLatestAmendment(histories[pcode] || '');
+  const amend = parseLatestAmendment(HISTORIES[pcode] || '');   // 用已常駐記憶體的 HISTORIES，免每次點對照都重讀 9.6MB 檔(降 GC 壓力/RSS)
   const out = {
     pcode, name: meta.name, level: meta.level,
     newDate: curDate, oldDate: oldEmpty ? '' : oldDate, oldSource, noPrior: oldEmpty,
@@ -912,17 +914,17 @@ function runCheck(group, now, official) {
 function sendJSON(res, code, obj) {
   try {
     if (res.writableEnded || res.destroyed) return;   // 連線已關/斷就不再寫入，避免在毀損的 socket 上拋錯
-    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY' });
     res.end(JSON.stringify(obj));
   } catch { /* 連線已斷，忽略 */ }
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
     if (Number(req.headers['content-length'] || 0) > 5e6) { const e = new Error('請求內容過大（上限 5MB）'); e.tooLarge = true; req.pause(); return reject(e); }   // 有宣告 Content-Length 就提早拒絕，免先緩衝 5MB
-    let data = '', done = false;
+    const chunks = []; let len = 0, done = false;
     const fail = (e) => { if (!done) { done = true; reject(e); } };          // 確保 Promise 一定有結果，避免請求卡死
-    req.on('data', (c) => { data += c; if (data.length > 5e6 && !done) { const e = new Error('請求內容過大（上限 5MB）'); e.tooLarge = true; req.pause(); fail(e); } });   // 暫停(停止累積)而非 destroy，讓外層能先回 413 給客戶端
-    req.on('end', () => { if (done) return; done = true; try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
+    req.on('data', (c) => { len += c.length; chunks.push(c); if (len > 5e6 && !done) { const e = new Error('請求內容過大（上限 5MB）'); e.tooLarge = true; req.pause(); fail(e); } });   // 累積 Buffer、以位元組計長(與 Content-Length 一致)；暫停而非 destroy 讓外層能回 413
+    req.on('end', () => { if (done) return; done = true; try { const s = Buffer.concat(chunks).toString('utf8'); resolve(s ? JSON.parse(s) : {}); } catch (e) { reject(e); } });   // 最後一次解碼：中文字若被 TCP 分塊切斷不會壞成 U+FFFD
     req.on('error', fail);
     req.on('close', () => fail(new Error('連線中斷')));                       // destroy()/中斷只發 close，不發 end → 在此收尾
   });
@@ -934,7 +936,7 @@ async function serveStatic(res, urlPath) {
   if (full !== PUBLIC_DIR && !full.startsWith(PUBLIC_DIR + path.sep)) { res.writeHead(403); return res.end('forbidden'); }
   try {
     const buf = await readFile(full);
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(full)] || 'application/octet-stream' });
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(full)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY' });
     res.end(buf);
   } catch {
     res.writeHead(404); res.end('not found');
@@ -971,6 +973,13 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
   const m = req.method;
   try {
+    // ---- 共用密碼閘(可選)：設了 AUTH_PASS 才啟用。給區網/公開部署最低限度防護；未設則維持本機單人免密碼。----
+    if (AUTH_PASS) {
+      const mm0 = /^Basic\s+(.+)$/i.exec(req.headers['authorization'] || '');
+      let okAuth = false;
+      if (mm0) { try { const dec = Buffer.from(mm0[1], 'base64').toString('utf8'); const pass = dec.slice(dec.indexOf(':') + 1); const a = Buffer.from(pass), b = Buffer.from(AUTH_PASS); okAuth = a.length === b.length && crypto.timingSafeEqual(a, b); } catch {} }
+      if (!okAuth) { res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="law-tracker"', 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('需要登入'); }
+    }
     // ---- API ----
     if (p === '/api/state' && m === 'GET') {
       const db = await loadGroups();
@@ -991,7 +1000,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/db/refresh' && m === 'POST') {
-      try { const meta = await refreshIndex(); LAST_SYNC = { at: new Date().toISOString(), ok: true }; return sendJSON(res, 200, { ok: true, db: meta, sync: syncMeta() }); }
+      if (Date.now() - LAST_MANUAL_REFRESH < 10 * 60000) return sendJSON(res, 200, { ok: true, db: dbMeta(), sync: syncMeta(), throttled: true });   // 節流：10 分鐘內已更新過就不重抓，避免反覆觸發 ~650MB 下載尖峰耗盡記憶體
+      try { const meta = await refreshIndex(); LAST_MANUAL_REFRESH = Date.now(); LAST_SYNC = { at: new Date().toISOString(), ok: true }; return sendJSON(res, 200, { ok: true, db: meta, sync: syncMeta() }); }
       catch (e) { LAST_SYNC = { at: new Date().toISOString(), ok: false, error: String(e.message || e) }; return sendJSON(res, 500, { error: String(e.message || e), sync: syncMeta() }); }
     }
 
@@ -1140,10 +1150,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if ((mm = p.match(/^\/api\/laws\/([^/]+)\/history$/)) && m === 'GET') {
-      const histories = await readJSON(HISTORIES_PATH, {});
       const pcode = decodeURIComponent(mm[1]);
       const meta = lawMeta(pcode);
-      return sendJSON(res, 200, { pcode, name: meta && meta.name, history: histories[pcode] || '' });
+      return sendJSON(res, 200, { pcode, name: meta && meta.name, history: HISTORIES[pcode] || '' });   // 用已常駐的 HISTORIES，免重讀 9.6MB 檔
     }
 
     if ((mm = p.match(/^\/api\/laws\/([^/]+)\/diff$/)) && m === 'GET') {
@@ -1228,4 +1237,7 @@ async function start() {
     scheduleDaily();
   }
 }
-start();
+// 全域防線：背景路徑若有非預期 rejection/exception，記 log 而非讓常駐服務直接退出(Node 24 預設會殺 process)
+process.on('unhandledRejection', (e) => console.error('  ⚠ unhandledRejection:', e && (e.stack || e.message || e)));
+process.on('uncaughtException', (e) => { console.error('  ✗ uncaughtException:', e && (e.stack || e)); process.exit(1); });
+start().catch((e) => { console.error('\n  ✗ 啟動失敗：', e && (e.stack || e.message || e), '\n'); process.exit(1); });
