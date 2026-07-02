@@ -768,6 +768,15 @@ const DOCX_CONTENT_TYPES = `<?xml version="1.0" encoding="UTF-8" standalone="yes
 const DOCX_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`;
 function buildDocx(diff) {
+  const ymd = (d) => (d && String(d).length === 8) ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : (d || '—');
+  if (diff.abolished) {   // 廢止法規：產生「已廢止」說明檔，而非空白對照表（與畫面一致，不讓使用者以為匯出失敗）
+    const t = wPara(wRun(diff.name + '　已廢止', { b: true, sz: 32 }), { spacing: 120, align: 'center' });
+    const body = wPara(wRun(`本法規已於 ${ymd(diff.abolishDate)} 廢止，無新舊條文可對照。`, { sz: 22 }), { spacing: 160 });
+    const note = (diff.amend && diff.amend.docNo) ? wPara(wRun('廢止令：' + diff.amend.docNo, { sz: 20, color: '666666' }), { spacing: 80 }) : '';
+    const adoc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${t}${body}${note}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134"/></w:sectPr></w:body></w:document>`;
+    return zipStore([{ name: '[Content_Types].xml', data: DOCX_CONTENT_TYPES }, { name: '_rels/.rels', data: DOCX_RELS }, { name: 'word/document.xml', data: adoc }]);
+  }
   const RB = diff.reasonsByArticle || {};
   const hasReasons = Object.keys(RB).length > 0;
   const W1 = hasReasons ? 3450 : 3850, W2 = W1, W3 = hasReasons ? 2500 : 1700;   // 合計 9400 dxa ＜ A4 直印可用寬
@@ -785,7 +794,6 @@ function buildDocx(diff) {
   const borders = ['top', 'left', 'bottom', 'right', 'insideH', 'insideV'].map((s) => `<w:${s} w:val="single" w:sz="4" w:color="AAAAAA"/>`).join('');
   const grid = `<w:tblGrid><w:gridCol w:w="${W1}"/><w:gridCol w:w="${W2}"/><w:gridCol w:w="${W3}"/></w:tblGrid>`;
   const tbl = `<w:tbl><w:tblPr><w:tblW w:w="${W1 + W2 + W3}" w:type="dxa"/><w:tblLayout w:type="fixed"/><w:tblBorders>${borders}</w:tblBorders></w:tblPr>${grid}${rows.join('')}</w:tbl>`;
-  const ymd = (d) => (d && String(d).length === 8) ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : (d || '—');
   const title = wPara(wRun(diff.name + '　新舊條文對照表', { b: true, sz: 32 }), { spacing: 120, align: 'center' });
   const sub = wPara(wRun(`新版 ${ymd(diff.newDate)}　↔　舊版 ${ymd(diff.oldDate)}　·　異動 ${diff.changedCount} 條`, { color: '666666', sz: 20 }), { spacing: 160, align: 'center' });
   const doc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -1249,5 +1257,10 @@ async function start() {
 }
 // 全域防線：背景路徑若有非預期 rejection/exception，記 log 而非讓常駐服務直接退出(Node 24 預設會殺 process)
 process.on('unhandledRejection', (e) => console.error('  ⚠ unhandledRejection:', e && (e.stack || e.message || e)));
-process.on('uncaughtException', (e) => { console.error('  ✗ uncaughtException:', e && (e.stack || e)); process.exit(1); });
+process.on('uncaughtException', (e) => {
+  console.error('  ✗ uncaughtException:', e && (e.stack || e));
+  const code = e && e.code;
+  if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'ERR_STREAM_WRITE_AFTER_END' || code === 'ERR_STREAM_DESTROYED') return;   // 客戶端中途斷線等良性 socket 錯誤：記 log 但不重啟(避免與 systemd Restart 形成當機迴圈)
+  process.exit(1);   // 其他未預期例外：狀態不明，交給 systemd/launchd 重啟
+});
 start().catch((e) => { console.error('\n  ✗ 啟動失敗：', e && (e.stack || e.message || e), '\n'); process.exit(1); });
